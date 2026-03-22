@@ -1,0 +1,27 @@
+[project]
+name = "az-cli-runner"
+version = "0.1.0"
+description = "API-driven isolated Azure CLI runner for Azure Container Apps"
+requires-python = ">=3.12"
+dependencies = [
+    "azure-cli>=2.84.0",
+    "fastapi>=0.135.1",
+    "pydantic>=2.12.5",
+    "pydantic-settings>=2.10.1",
+    "uvicorn[standard]>=0.42.0",
+]
+
+[dependency-groups]
+dev = [
+    "httpx>=0.28.1",
+    "psutil>=7.2.2",
+    "pytest>=9.0.2",
+    "pytest-asyncio>=1.3.0",
+]
+
+[tool.uv]
+environments = ["sys_platform == 'linux'"]
+prerelease = "allow"
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
