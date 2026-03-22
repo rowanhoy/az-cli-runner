@@ -1,63 +1,126 @@
-"""Azure CLI command executor with session isolation.
+"""Azure CLI executor with pooled subprocess sessions.
 
-Executes Azure CLI commands in isolated environments using per-session
-AZURE_CONFIG_DIR directories. This ensures concurrent sessions under
-different subscriptions do not interfere with each other.
+The executor maintains a bounded pool of authenticated `AZURE_CONFIG_DIR`
+directories. Each pooled session is logged in once using the shared service
+principal credentials and can then be reused for many commands. Request-level
+subscription targeting is handled by injecting `--subscription`, which avoids
+running `az login` and `az account set` on every request.
 """
 
 import asyncio
+from dataclasses import dataclass
+import json
 import os
 import shutil
 import tempfile
+import time
 import uuid
-from typing import Optional
 
-from app.models import AzCliResponse
+from app.config import Settings
+from app.models import AzCliInvocationTiming, AzCliResponse, AzCliTiming
 
 
-class AzCliExecutor:
-    """Executes Azure CLI commands in isolated sessions.
+@dataclass(slots=True)
+class _PooledSession:
+    """Reusable authenticated Azure CLI session state."""
 
-    Each execution creates a temporary AZURE_CONFIG_DIR to ensure
-    complete isolation between concurrent sessions. The service principal
-    credentials are read from environment variables.
-    """
+    config_dir: str
+    env: dict[str, str]
 
-    def __init__(self) -> None:
-        self.client_id: Optional[str] = os.environ.get("AZURE_CLIENT_ID")
-        self.client_secret: Optional[str] = os.environ.get("AZURE_CLIENT_SECRET")
-        self.tenant_id: Optional[str] = os.environ.get("AZURE_TENANT_ID")
 
-    def _check_credentials(self) -> None:
-        """Verify that service principal credentials are configured.
+class BaseAzCliExecutor:
+    """Shared helpers for Azure CLI execution paths."""
 
-        Raises:
-            RuntimeError: If any required credential environment variable is missing.
-        """
-        missing = []
-        if not self.client_id:
-            missing.append("AZURE_CLIENT_ID")
-        if not self.client_secret:
-            missing.append("AZURE_CLIENT_SECRET")
-        if not self.tenant_id:
-            missing.append("AZURE_TENANT_ID")
-        if missing:
-            raise RuntimeError(
-                f"Missing required environment variables: {', '.join(missing)}"
-            )
+    def __init__(self, settings: Settings) -> None:
+        self.settings = settings
+
+    @staticmethod
+    def _force_json_output(args: list[str]) -> list[str]:
+        """Normalize command arguments so Azure CLI always returns JSON."""
+        normalized_args: list[str] = []
+        skip_next = False
+
+        for arg in args:
+            if skip_next:
+                skip_next = False
+                continue
+
+            if arg in {"-o", "--output"}:
+                skip_next = True
+                continue
+
+            if arg.startswith("--output=") or arg.startswith("-o="):
+                continue
+
+            normalized_args.append(arg)
+
+        return [*normalized_args, "--output", "json"]
+
+    def _login_args(self) -> list[str]:
+        """Build the Azure CLI login arguments."""
+        return [
+            "login",
+            "--service-principal",
+            "--username",
+            self.settings.azure_client_id,
+            "--password",
+            self.settings.azure_client_secret,
+            "--tenant",
+            self.settings.azure_tenant_id,
+            "--output",
+            "none",
+        ]
+
+    @staticmethod
+    def _with_subscription(args: list[str], subscription_id: str) -> list[str]:
+        """Normalize command arguments to enforce one subscription value."""
+        normalized_args: list[str] = []
+        skip_next = False
+
+        for arg in args:
+            if skip_next:
+                skip_next = False
+                continue
+
+            if arg == "--subscription":
+                skip_next = True
+                continue
+
+            if arg.startswith("--subscription="):
+                continue
+
+            normalized_args.append(arg)
+
+        return [*normalized_args, "--subscription", subscription_id]
+
+    @staticmethod
+    def _parse_json_output(stdout: str) -> object | None:
+        """Parse JSON command output when present."""
+        if not stdout.strip():
+            return None
+
+        try:
+            return json.loads(stdout)
+        except json.JSONDecodeError as exc:
+            raise RuntimeError("az command returned invalid JSON output") from exc
+
+
+class AzCliExecutor(BaseAzCliExecutor):
+    """Executes Azure CLI commands through pooled `az` subprocess sessions."""
+
+    def __init__(self, settings: Settings) -> None:
+        super().__init__(settings)
+        self._initialization_lock = asyncio.Lock()
+        self._session_queue: asyncio.Queue[_PooledSession] = asyncio.Queue(
+            maxsize=self.settings.max_concurrent_sessions
+        )
+        self._initialized = False
 
     async def _run_az_command(
         self, args: list[str], env: dict[str, str]
-    ) -> tuple[int, str, str]:
-        """Run an az cli command as a subprocess.
-
-        Args:
-            args: The argument list to pass to 'az'.
-            env: The environment variables for the subprocess.
-
-        Returns:
-            A tuple of (return_code, stdout, stderr).
-        """
+    ) -> tuple[int, str, str, AzCliInvocationTiming]:
+        """Run an az cli command as a subprocess."""
+        start = time.perf_counter()
         process = await asyncio.create_subprocess_exec(
             "az",
             *args,
@@ -65,77 +128,104 @@ class AzCliExecutor:
             stderr=asyncio.subprocess.PIPE,
             env=env,
         )
+        startup_elapsed = time.perf_counter() - start
         stdout_bytes, stderr_bytes = await process.communicate()
+        total_elapsed = time.perf_counter() - start
         return (
             process.returncode or 0,
             stdout_bytes.decode("utf-8", errors="replace"),
             stderr_bytes.decode("utf-8", errors="replace"),
+            AzCliInvocationTiming(
+                total_seconds=total_elapsed,
+                startup_seconds=startup_elapsed,
+                execution_seconds=total_elapsed - startup_elapsed,
+            ),
         )
+
+    async def _authenticate_session(self, config_dir: str) -> dict[str, str]:
+        """Authenticate one reusable session config directory."""
+        env = os.environ.copy()
+        env["AZURE_CONFIG_DIR"] = config_dir
+
+        login_rc, _, login_stderr, _ = await self._run_az_command(
+            self._login_args(),
+            env=env,
+        )
+        if login_rc != 0:
+            raise RuntimeError(f"az login failed (exit {login_rc}): {login_stderr}")
+
+        return env
+
+    async def initialize(self) -> None:
+        """Create and authenticate the bounded session pool once."""
+        if self._initialized:
+            return
+
+        async with self._initialization_lock:
+            if self._initialized:
+                return
+
+            template_dir = tempfile.mkdtemp(prefix="az-cli-runner-template-")
+
+            try:
+                await self._authenticate_session(template_dir)
+
+                for _ in range(self.settings.max_concurrent_sessions):
+                    session_id = uuid.uuid4().hex
+                    session_dir = tempfile.mkdtemp(prefix=f"az-cli-runner-{session_id}-")
+                    shutil.rmtree(session_dir, ignore_errors=True)
+                    shutil.copytree(template_dir, session_dir)
+                    env = os.environ.copy()
+                    env["AZURE_CONFIG_DIR"] = session_dir
+                    self._session_queue.put_nowait(
+                        _PooledSession(config_dir=session_dir, env=env)
+                    )
+            finally:
+                shutil.rmtree(template_dir, ignore_errors=True)
+
+            self._initialized = True
+
+    async def close(self) -> None:
+        """Clean up pooled authenticated session directories."""
+        while not self._session_queue.empty():
+            session = self._session_queue.get_nowait()
+            shutil.rmtree(session.config_dir, ignore_errors=True)
+            self._session_queue.task_done()
+
+        self._initialized = False
 
     async def execute(
         self, command_args: list[str], subscription_id: str
     ) -> AzCliResponse:
-        """Execute an Azure CLI command under an isolated session.
+        """Execute an Azure CLI command using a pooled authenticated session."""
+        await self.initialize()
 
-        Creates a temporary AZURE_CONFIG_DIR, authenticates with the service
-        principal, sets the subscription, executes the command, and cleans up.
-
-        Args:
-            command_args: The validated argument list (without leading 'az').
-            subscription_id: The Azure subscription ID to use.
-
-        Returns:
-            AzCliResponse with the command output and exit code.
-
-        Raises:
-            RuntimeError: If credentials are not configured or login fails.
-        """
-        self._check_credentials()
-
-        session_id = uuid.uuid4().hex
-        config_dir = tempfile.mkdtemp(prefix=f"az-cli-runner-{session_id}-")
-
+        request_start = time.perf_counter()
+        acquire_start = time.perf_counter()
+        session = await self._session_queue.get()
+        session_acquire_seconds = time.perf_counter() - acquire_start
         try:
-            # Build isolated environment
-            env = os.environ.copy()
-            env["AZURE_CONFIG_DIR"] = config_dir
-
-            # Login with service principal
-            login_rc, login_stdout, login_stderr = await self._run_az_command(
-                [
-                    "login",
-                    "--service-principal",
-                    "--username",
-                    self.client_id,
-                    "--password",
-                    self.client_secret,
-                    "--tenant",
-                    self.tenant_id,
-                ],
-                env=env,
+            rc, stdout, stderr, command_timing = await self._run_az_command(
+                self._force_json_output(
+                    self._with_subscription(command_args, subscription_id)
+                ),
+                env=session.env,
             )
-            if login_rc != 0:
-                raise RuntimeError(f"az login failed (exit {login_rc}): {login_stderr}")
-
-            # Set subscription
-            sub_rc, _, sub_stderr = await self._run_az_command(
-                ["account", "set", "--subscription", subscription_id],
-                env=env,
-            )
-            if sub_rc != 0:
-                raise RuntimeError(
-                    f"az account set failed (exit {sub_rc}): {sub_stderr}"
-                )
-
-            # Execute the actual command
-            rc, stdout, stderr = await self._run_az_command(command_args, env=env)
-
-            return AzCliResponse(
-                success=rc == 0,
-                exit_code=rc,
-                stdout=stdout,
-                stderr=stderr,
-            )
+            parsed_result = self._parse_json_output(stdout)
         finally:
-            # Clean up the isolated config directory
-            shutil.rmtree(config_dir, ignore_errors=True)
+            release_start = time.perf_counter()
+            self._session_queue.put_nowait(session)
+            session_release_seconds = time.perf_counter() - release_start
+
+        return AzCliResponse(
+            success=rc == 0,
+            exit_code=rc,
+            result=parsed_result,
+            stderr=stderr,
+            timings=AzCliTiming(
+                total_seconds=time.perf_counter() - request_start,
+                session_acquire_seconds=session_acquire_seconds,
+                command=command_timing,
+                session_release_seconds=session_release_seconds,
+            ),
+        )
