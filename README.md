@@ -100,4 +100,3 @@ benchmarks/
   memory_benchmark.py  # Concurrent session memory testing
 Dockerfile
 ```
-API driven isolated Az CLI runner - designed for use by agents
